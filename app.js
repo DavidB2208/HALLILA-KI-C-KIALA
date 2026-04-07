@@ -38,8 +38,18 @@
   const INVITE_RETURN_KEY = 'hallila_invite_return_v1';
   const SUPABASE_CONFIG = window.HALLILA_SUPABASE_CONFIG || {};
 
-  const SUPABASE_AUTH_REDIRECT = `${window.location.origin}${window.location.pathname}`;
+  function normalizeAbsoluteUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try { return new URL(raw).toString(); } catch { return ''; }
+  }
+
+  const DEFAULT_APP_URL = `${window.location.origin}${window.location.pathname}`;
+  const PUBLIC_SITE_URL = (() => normalizeAbsoluteUrl(SUPABASE_CONFIG.siteUrl || SUPABASE_CONFIG.publicSiteUrl || '') || DEFAULT_APP_URL)();
+  const AUTH_CONFIRM_REDIRECT = `${PUBLIC_SITE_URL}${PUBLIC_SITE_URL.includes('?') ? '&' : '?'}auth_action=confirm`;
+  const AUTH_RECOVERY_REDIRECT = `${PUBLIC_SITE_URL}${PUBLIC_SITE_URL.includes('?') ? '&' : '?'}auth_action=recovery#account`;
   const AUTH_PLACEHOLDER_HASH = '__SUPABASE_AUTH__';
+  const PENDING_PROFILE_KEY = 'hallila_pending_profile_v1';
   const ROOM_STATE_TRANSITIONS = Object.freeze({
     lobby: ['ranking'],
     ranking: ['results', 'lobby'],
@@ -100,6 +110,8 @@
       adminRecoveryKey: '',
       adminRecoveryStatus: 'idle',
       adminRecoveryError: '',
+      authPendingEmail: '',
+      authRecoveryMode: false,
       musicEnabled: (() => { try { const raw = localStorage.getItem(MUSIC_STORAGE_KEY); return raw === null ? true : JSON.parse(raw); } catch { return true; } })()
     },
     role: null,
@@ -164,6 +176,32 @@
     removeKey(INVITE_RETURN_KEY);
   }
 
+  function savePendingProfile(profile) {
+    writeJson(PENDING_PROFILE_KEY, profile || null);
+  }
+
+  function loadPendingProfile() {
+    return readJson(PENDING_PROFILE_KEY, null);
+  }
+
+  function clearPendingProfile() {
+    removeKey(PENDING_PROFILE_KEY);
+  }
+
+  function authActionParam() {
+    try { return new URLSearchParams(window.location.search).get('auth_action') || ''; } catch { return ''; }
+  }
+
+  function authHashParams() {
+    try { return new URLSearchParams((window.location.hash || '').replace(/^#/, '')); } catch { return new URLSearchParams(); }
+  }
+
+  function clearAuthActionParam() {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('auth_action');
+    history.replaceState({}, '', url.toString());
+  }
+
   function isLocalOnlyHost(hostname) {
     const host = String(hostname || '').toLowerCase();
     if (!host) return false;
@@ -215,6 +253,14 @@
 
   function authManagedPasswordHash() {
     return AUTH_PLACEHOLDER_HASH;
+  }
+
+  function currentAuthUserId() {
+    return state.account?.id || null;
+  }
+
+  function dbCanWrite() {
+    return remoteAuthEnabled() && !!currentAuthUserId();
   }
 
   function upsertLocalUserRecord(user, persist = true) {
@@ -400,6 +446,31 @@
     if (PLAYER_COLORS.includes(user.profileColor)) state.ui.joinColor = user.profileColor;
   }
 
+  async function persistAccountProfileRemote(user, personas) {
+    if (!remoteAuthEnabled() || !user?.id) return { ok: true };
+    const client = dbClient();
+    const profileResponse = await client.from('users').upsert(mapLocalUserToDb(user), { onConflict: 'id' });
+    if (profileResponse.error) return { ok: false, error: profileResponse.error.message || 'Impossible de synchroniser le profil.' };
+    if (Array.isArray(personas) && personas.length) {
+      const personaResponse = await client.from('personas').upsert(personas.map(mapLocalPersonaToDb), { onConflict: 'id' });
+      if (personaResponse.error) return { ok: false, error: personaResponse.error.message || 'Impossible de synchroniser les personas.' };
+    }
+    return { ok: true };
+  }
+
+  async function resendConfirmationFromUi() {
+    if (!remoteAuthEnabled()) return { ok: false, error: 'Supabase Auth n’est pas activé.' };
+    const email = String(state.ui.authPendingEmail || state.ui.authRegisterEmail || state.ui.authLoginEmail || '').trim().toLowerCase();
+    if (!email) return { ok: false, error: 'Entre d’abord l’e-mail du compte.' };
+    const { error } = await dbClient().auth.resend({
+      type: 'signup',
+      email,
+      options: { emailRedirectTo: AUTH_CONFIRM_REDIRECT }
+    });
+    if (error) return { ok: false, error: error.message || 'Impossible de renvoyer le mail de confirmation.' };
+    state.ui.authPendingEmail = email;
+    return { ok: true, message: 'Mail de confirmation renvoyé.' };
+  }
 
   async function createAccountFromUi() {
     ensureAccountSeedData();
@@ -431,19 +502,40 @@
       const { data: signUpData, error: signUpError } = await client.auth.signUp({
         email,
         password,
-        options: { data: { display_name: displayName } }
+        options: {
+          data: { display_name: displayName },
+          emailRedirectTo: AUTH_CONFIRM_REDIRECT
+        }
       });
       if (signUpError) return { ok: false, error: signUpError.message || 'Impossible de créer le compte en ligne.' };
       if (signUpData?.user?.id) user.id = signUpData.user.id;
       user.passwordHash = authManagedPasswordHash();
-      const profileResponse = await client.from('users').upsert(mapLocalUserToDb(user), { onConflict: 'id' });
-      if (profileResponse.error) return { ok: false, error: profileResponse.error.message || 'Compte créé, mais le profil n’a pas pu être synchronisé.' };
       savePersonas(personas);
-      rememberAuthenticatedUser(user);
+      if (signUpData?.session) {
+        const profileSync = await persistAccountProfileRemote(user, personas);
+        if (!profileSync.ok) return profileSync;
+        rememberAuthenticatedUser(user);
+        clearPendingProfile();
+        state.ui.authPendingEmail = '';
+        return {
+          ok: true,
+          user,
+          message: 'Compte créé et connecté.'
+        };
+      }
+      savePendingProfile({
+        email,
+        displayName,
+        profileColor: user.profileColor,
+        linkMode: state.ui.authLinkMode,
+        personaId: state.ui.authPersonaId,
+        otherName: state.ui.authOtherName
+      });
+      state.ui.authPendingEmail = email;
       return {
         ok: true,
         user,
-        message: signUpData?.session ? 'Compte créé et connecté.' : 'Compte créé. Vérifie la configuration e-mail de Supabase Auth si tu veux imposer une confirmation.'
+        message: 'Compte créé. Vérifie ton e-mail pour activer le compte.'
       };
     }
 
@@ -498,6 +590,7 @@
       }
       user.passwordHash = authManagedPasswordHash();
       rememberAuthenticatedUser(user);
+      state.ui.authRecoveryMode = false;
       return { ok: true, user, message: 'Connexion en ligne réussie.' };
     }
 
@@ -509,6 +602,7 @@
     state.account = user;
     bindAuthUiFromUser(user);
     syncJoinDefaultsFromAccount();
+    state.ui.authRecoveryMode = false;
     return { ok: true, user, message: 'Connexion réussie.' };
   }
 
@@ -538,16 +632,18 @@
         state.ui.authForgotPassword = '';
         state.ui.authForgotConfirm = '';
         state.ui.authTab = 'login';
+        state.ui.authRecoveryMode = false;
         return { ok: true, message: 'Mot de passe mis à jour.' };
       }
 
-      const { error } = await client.auth.resetPasswordForEmail(email, { redirectTo: SUPABASE_AUTH_REDIRECT });
+      const { error } = await client.auth.resetPasswordForEmail(email, { redirectTo: AUTH_RECOVERY_REDIRECT });
       if (error) return { ok: false, error: error.message || 'Impossible d’envoyer l’e-mail de réinitialisation.' };
       state.ui.authLoginEmail = email;
       state.ui.authLoginPassword = '';
       state.ui.authForgotPassword = '';
       state.ui.authForgotConfirm = '';
       state.ui.authTab = 'login';
+      state.ui.authRecoveryMode = false;
       return { ok: true, message: 'Un e-mail de réinitialisation a été envoyé.' };
     }
 
@@ -564,6 +660,7 @@
     state.ui.authForgotPassword = '';
     state.ui.authForgotConfirm = '';
     state.ui.authTab = 'login';
+    state.ui.authRecoveryMode = false;
     return { ok: true, user, message: 'Mot de passe réinitialisé.' };
   }
 
@@ -576,6 +673,7 @@
     state.ui.authBoundUserId = null;
     state.ui.joinPseudo = '';
     state.ui.joinColor = PLAYER_COLORS[0];
+    state.ui.authRecoveryMode = false;
   }
 
   async function updateAccountFromUi() {
@@ -687,6 +785,7 @@ function dbStatusLabel() {
   if (state.db.syncing) return 'Sync BDD…';
   if (state.db.pendingKinds?.size) return 'Sync en attente';
   if (state.db.error) return 'Erreur BDD';
+  if (state.db.ready && !currentAuthUserId()) return 'BDD liée (lecture seule)';
   if (state.db.ready) return 'BDD liée';
   return 'Connexion BDD';
 }
@@ -715,6 +814,24 @@ function hydrateRoomPayload(rawRoom, roomId = null) {
   room.startedAt = room.startedAt || null;
   room.completedAt = room.completedAt || null;
   return room;
+}
+
+async function applyPendingProfileForAuthenticatedUser(user) {
+  const pending = loadPendingProfile();
+  if (!pending || !user?.email || String(pending.email || '').toLowerCase() !== String(user.email || '').toLowerCase()) return user;
+  const personas = personasStore();
+  user.displayName = pending.displayName || user.displayName;
+  user.profileColor = pending.profileColor || user.profileColor;
+  user.updatedAt = nowIso();
+  const linkResult = applyPersonaSelection(user, personas, pending.linkMode, pending.personaId, pending.otherName);
+  if (!linkResult.ok) throw new Error(linkResult.error || 'Impossible d’appliquer le profil en attente.');
+  savePersonas(personas);
+  saveUsers([user, ...usersStore().filter((entry) => entry.id !== user.id)]);
+  const syncResult = await persistAccountProfileRemote(user, personas);
+  if (!syncResult.ok) throw new Error(syncResult.error || 'Impossible de finaliser le profil en ligne.');
+  clearPendingProfile();
+  state.ui.authPendingEmail = '';
+  return user;
 }
 
 async function syncCurrentUserFromRemoteSession() {
@@ -746,20 +863,35 @@ async function syncCurrentUserFromRemoteSession() {
   user.id = authUser.id;
   user.email = String(authUser.email).toLowerCase();
   user.passwordHash = authManagedPasswordHash();
+  user = await applyPendingProfileForAuthenticatedUser(user);
   rememberAuthenticatedUser(user, { persist: false });
 }
 
 function bindRemoteAuthListener() {
   if (!remoteAuthEnabled() || state.db.authListenerBound) return;
   state.db.authListenerBound = true;
-  dbClient().auth.onAuthStateChange(async (_event, session) => {
+  dbClient().auth.onAuthStateChange(async (event, session) => {
     try {
       if (session?.user?.email) {
         await syncCurrentUserFromRemoteSession();
+        if (event === 'PASSWORD_RECOVERY') {
+          state.ui.authRecoveryMode = true;
+          state.ui.authForgotEmail = String(session.user.email || '').toLowerCase();
+          state.ui.authForgotPassword = '';
+          state.ui.authForgotConfirm = '';
+          state.ui.authTab = 'forgot';
+          setRoute({}, '#account');
+          setNotice('Lien de récupération détecté. Choisis maintenant un nouveau mot de passe.', 'warn', 5200);
+        } else if (event === 'SIGNED_IN' && authActionParam() === 'confirm') {
+          clearAuthActionParam();
+          setRoute({}, '#profile');
+          setNotice('Adresse e-mail vérifiée. Le compte est maintenant actif.', 'ok', 5200);
+        }
       } else if (state.account) {
         clearCurrentUserId();
         state.account = null;
         state.ui.authBoundUserId = null;
+        state.ui.authRecoveryMode = false;
       }
     } catch (error) {
       state.db.error = error?.message || 'Erreur de session';
@@ -870,19 +1002,25 @@ function ensurePersonasForNames(names, ownerUserId = null) {
 async function dbFetchCoreData() {
   const client = dbClient();
   if (!client) return;
-  const [{ data: usersRows, error: usersError }, { data: personaRows, error: personaError }, { data: setRows, error: setError }, { data: setItemRows, error: setItemError }, { data: historyRows, error: historyError }] = await Promise.all([
-    client.from('users').select('*').order('created_at', { ascending: true }),
+  const currentId = currentAuthUserId();
+  const profilePromise = currentId
+    ? client.from('users').select('*').eq('id', currentId).maybeSingle()
+    : Promise.resolve({ data: null, error: null });
+  const [{ data: profileRow, error: profileError }, { data: personaRows, error: personaError }, { data: setRows, error: setError }, { data: setItemRows, error: setItemError }, { data: historyRows, error: historyError }] = await Promise.all([
+    profilePromise,
     client.from('personas').select('*').order('created_at', { ascending: true }),
     client.from('persona_sets').select('*').order('created_at', { ascending: true }),
     client.from('persona_set_items').select('*').order('display_order', { ascending: true }),
     client.from('history_entries').select('*').order('completed_at', { ascending: false }).limit(200)
   ]);
-  if (usersError) throw usersError;
+  if (profileError && profileError.code !== 'PGRST116') throw profileError;
   if (personaError) throw personaError;
   if (setError) throw setError;
   if (setItemError) throw setItemError;
   if (historyError) throw historyError;
-  if (Array.isArray(usersRows) && usersRows.length) writeJson(USERS_KEY, usersRows.map(mapDbUserToLocal));
+  if (profileRow) {
+    writeJson(USERS_KEY, [mapDbUserToLocal(profileRow), ...usersStore().filter((entry) => entry.id !== profileRow.id)]);
+  }
   if (Array.isArray(personaRows) && personaRows.length) writeJson(PERSONAS_KEY, personaRows.map(mapDbPersonaToLocal));
   if (Array.isArray(setRows)) {
     const personas = personaRows && personaRows.length ? personaRows.map(mapDbPersonaToLocal) : personasStore();
@@ -917,16 +1055,16 @@ async function dbFetchCoreData() {
 
 async function dbSyncUsers() {
   const client = dbClient();
-  if (!client) return;
-  const users = usersStore();
-  if (!users.length) return;
-  const { error } = await client.from('users').upsert(users.map(mapLocalUserToDb), { onConflict: 'id' });
+  if (!client || !dbCanWrite()) return;
+  const current = getCurrentUser();
+  if (!current?.id) return;
+  const { error } = await client.from('users').upsert(mapLocalUserToDb(current), { onConflict: 'id' });
   if (error) throw error;
 }
 
 async function dbSyncPersonas() {
   const client = dbClient();
-  if (!client) return;
+  if (!client || !dbCanWrite()) return;
   const personas = personasStore();
   if (!personas.length) return;
   const { error } = await client.from('personas').upsert(personas.map(mapLocalPersonaToDb), { onConflict: 'id' });
@@ -935,9 +1073,9 @@ async function dbSyncPersonas() {
 
 async function dbSyncSets() {
   const client = dbClient();
-  if (!client) return;
+  if (!client || !dbCanWrite()) return;
   const account = getCurrentUser();
-  const sets = itemSetsStore();
+  const sets = itemSetsStore().filter((set) => !set.ownerUserId || set.ownerUserId === account?.id);
   if (!sets.length) return;
   ensurePersonasForNames(sets.flatMap((set) => set.items || []), account?.id || null);
   await dbSyncPersonas();
@@ -975,7 +1113,7 @@ async function dbSyncSets() {
 
 async function dbSyncRoom(room) {
   const client = dbClient();
-  if (!client || !room) return;
+  if (!client || !room || !dbCanWrite()) return;
   ensurePersonasForNames(room.items || [], room.hostUserId || null);
   await dbSyncPersonas();
   const personas = personasStore();
@@ -1176,7 +1314,7 @@ async function dbSyncRoom(room) {
 
 function scheduleDbSync(kind = 'all') {
   const client = dbClient();
-  if (!client) return;
+  if (!client || !dbCanWrite()) return;
   state.db.pendingKinds.add(kind);
   if (state.db.timer) clearTimeout(state.db.timer);
   state.db.timer = setTimeout(async () => {
@@ -1212,6 +1350,7 @@ async function dbBootstrap() {
   render();
   try {
     bindRemoteAuthListener();
+    await handleAuthRedirectLanding();
     await syncCurrentUserFromRemoteSession();
     await dbFetchCoreData();
     state.db.ready = true;
@@ -1222,6 +1361,40 @@ async function dbBootstrap() {
   } finally {
     state.db.syncing = false;
     render();
+  }
+}
+
+async function handleAuthRedirectLanding() {
+  if (!remoteAuthEnabled()) return;
+  const client = dbClient();
+  const search = new URLSearchParams(window.location.search);
+  const hash = authHashParams();
+  const tokenHash = search.get('token_hash') || hash.get('token_hash');
+  const type = search.get('type') || hash.get('type');
+  const errorDescription = hash.get('error_description') || search.get('error_description');
+  if (errorDescription) {
+    state.db.error = errorDescription;
+    setRoute({}, '#account');
+    setNotice(errorDescription, 'bad', 5200);
+  }
+  if (tokenHash && type && ['email', 'recovery', 'invite', 'email_change'].includes(type)) {
+    const { error } = await client.auth.verifyOtp({ token_hash: tokenHash, type });
+    if (error) {
+      state.db.error = error.message || 'Impossible de valider le lien reçu par e-mail.';
+      setRoute({}, '#account');
+      setNotice(state.db.error, 'bad', 5200);
+    } else if (type === 'recovery') {
+      state.ui.authRecoveryMode = true;
+      state.ui.authTab = 'forgot';
+      setRoute({}, '#account');
+      setNotice('Lien de récupération validé. Choisis un nouveau mot de passe.', 'warn', 5200);
+    } else {
+      setRoute({}, '#profile');
+      setNotice('Adresse e-mail vérifiée. Le compte est maintenant actif.', 'ok', 5200);
+    }
+    const url = new URL(window.location.href);
+    ['token_hash', 'type', 'access_token', 'refresh_token', 'expires_in', 'expires_at'].forEach((key) => url.searchParams.delete(key));
+    history.replaceState({}, '', `${url.origin}${url.pathname}${url.search}${window.location.hash && window.location.hash.startsWith('#account') ? '#account' : ''}`);
   }
 }
 
@@ -2870,7 +3043,7 @@ async function dbBootstrap() {
       <div class="topbar">
         <button class="btn" data-action="go-home">${inviteReturn?.joinId ? 'Retour au lien' : 'Retour'}</button>
         ${brand()}
-        <div class="meta-side"><div class="subtle">${remoteAuthEnabled() ? 'Supabase Auth activé' : 'Compte local de démonstration'}</div></div>
+        <div class="meta-side"><div class="subtle">${remoteAuthEnabled() ? `Supabase Auth activé · redirection ${escapeHtml(PUBLIC_SITE_URL)}` : 'Compte local de démonstration'}</div></div>
       </div>
       <div class="create-stack">
         <div class="card">
@@ -2910,7 +3083,8 @@ async function dbBootstrap() {
                   <input id="auth-other-name" class="text-input" placeholder="Ton nom / ton blaze" value="${escapeHtml(state.ui.authOtherName)}">
                 </div>
               ` : ''}
-              <div class="row"><button class="big-btn" style="min-width:0;width:auto;" data-action="create-account">Créer mon compte</button></div>
+              <div class="row"><button class="big-btn" style="min-width:0;width:auto;" data-action="create-account">Créer mon compte</button><button class="btn" data-action="resend-confirmation">Renvoyer le mail de confirmation</button></div>
+              ${state.ui.authPendingEmail ? `<div class="footer-note">Dernier e-mail en attente de validation : ${escapeHtml(state.ui.authPendingEmail)}</div>` : ''}
             </div>
           </div>
         ` : state.ui.authTab === 'login' ? `
@@ -2930,7 +3104,7 @@ async function dbBootstrap() {
               <div><div class="label-top">Email du compte</div><input id="auth-forgot-email" class="text-input" placeholder="toi@mail.com" value="${escapeHtml(state.ui.authForgotEmail)}"></div>
               <div><div class="label-top">Nouveau mot de passe</div><input id="auth-forgot-password" type="password" class="text-input" placeholder="••••••" value="${escapeHtml(state.ui.authForgotPassword)}"></div>
               <div><div class="label-top">Confirmer le nouveau mot de passe</div><input id="auth-forgot-confirm" type="password" class="text-input" placeholder="••••••" value="${escapeHtml(state.ui.authForgotConfirm)}"></div>
-              <div class="footer-note">Réinitialisation locale de démonstration : le mot de passe du compte est mis à jour directement dans l’application.</div>
+              <div class="footer-note">${state.ui.authRecoveryMode ? 'Le lien de récupération a été validé. Entre maintenant le nouveau mot de passe puis clique sur Réinitialiser.' : (remoteAuthEnabled() ? `Un e-mail te renverra vers ${escapeHtml(PUBLIC_SITE_URL)} pour choisir un nouveau mot de passe.` : 'Réinitialisation locale de démonstration : le mot de passe du compte est mis à jour directement dans l’application.')}</div>
               <div class="row">
                 <button class="big-btn" style="min-width:0;width:auto;" data-action="reset-password">Réinitialiser le mot de passe</button>
                 <button class="btn" data-action="switch-auth-login">Retour à la connexion</button>
@@ -3969,10 +4143,18 @@ async function dbBootstrap() {
     if (action === 'create-account') {
       const result = await createAccountFromUi();
       if (!result.ok) { setNotice(result.error, 'bad'); return; }
-      setNotice(result.message || 'Compte créé. Tu peux maintenant jouer et suivre tes stats.', 'ok');
+      setNotice(result.message || 'Compte créé. Tu peux maintenant jouer et suivre tes stats.', 'ok', 5200);
       const inviteReturn = inviteReturnState();
-      if (inviteReturn?.joinId) setRoute({ join: inviteReturn.joinId, theme: inviteReturn.themeHint || '' }, '');
-      else setRoute({}, '#profile');
+      if (inviteReturn?.joinId && result.message === 'Compte créé et connecté.') setRoute({ join: inviteReturn.joinId, theme: inviteReturn.themeHint || '' }, '');
+      else if (result.message === 'Compte créé et connecté.') setRoute({}, '#profile');
+      else setRoute({}, '#account');
+      render();
+      return;
+    }
+    if (action === 'resend-confirmation') {
+      const result = await resendConfirmationFromUi();
+      if (!result.ok) { setNotice(result.error, 'bad'); return; }
+      setNotice(result.message || 'Mail renvoyé.', 'ok', 5200);
       render();
       return;
     }

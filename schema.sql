@@ -227,3 +227,355 @@ from (values
 on conflict (slug) do nothing;
 
 create index if not exists idx_games_admin_token on games(admin_token);
+
+
+-- =========================
+-- Triggers de protection
+-- =========================
+
+create or replace function protect_core_personas()
+returns trigger as $$
+begin
+  if old.category = 'core' then
+    new.name := old.name;
+    new.slug := old.slug;
+    new.category := old.category;
+    new.created_by_user_id := old.created_by_user_id;
+    new.is_claimable := old.is_claimable;
+    new.is_active := old.is_active;
+    new.created_at := old.created_at;
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists trg_protect_core_personas on personas;
+create trigger trg_protect_core_personas
+before update on personas
+for each row execute function protect_core_personas();
+
+-- =========================
+-- Fonctions helpers RLS
+-- =========================
+
+create or replace function public.is_game_host(target_game_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.games g
+    where g.id = target_game_id
+      and g.host_user_id = auth.uid()
+  );
+$$;
+
+create or replace function public.can_read_set(target_set_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.persona_sets s
+    where s.id = target_set_id
+      and (
+        s.visibility in ('shared', 'public')
+        or s.owner_user_id = auth.uid()
+      )
+  );
+$$;
+
+create or replace function public.owns_history_entry(target_history_entry_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.history_entries h
+    where h.id = target_history_entry_id
+      and h.created_by_user_id = auth.uid()
+  );
+$$;
+
+grant execute on function public.is_game_host(uuid) to authenticated;
+grant execute on function public.can_read_set(uuid) to anon, authenticated;
+grant execute on function public.owns_history_entry(uuid) to authenticated;
+
+-- =========================
+-- Enable RLS
+-- =========================
+
+alter table public.users enable row level security;
+alter table public.personas enable row level security;
+alter table public.persona_sets enable row level security;
+alter table public.persona_set_items enable row level security;
+alter table public.games enable row level security;
+alter table public.game_players enable row level security;
+alter table public.game_rounds enable row level security;
+alter table public.idea_box_entries enable row level security;
+alter table public.player_rankings enable row level security;
+alter table public.round_results enable row level security;
+alter table public.round_reactions enable row level security;
+alter table public.history_entries enable row level security;
+alter table public.history_entry_players enable row level security;
+
+-- =========================
+-- Drop policies si rerun
+-- =========================
+
+drop policy if exists users_select_own on public.users;
+drop policy if exists users_insert_own on public.users;
+drop policy if exists users_update_own on public.users;
+drop policy if exists users_delete_own on public.users;
+
+drop policy if exists personas_public_read on public.personas;
+drop policy if exists personas_authenticated_insert on public.personas;
+drop policy if exists personas_authenticated_update on public.personas;
+
+drop policy if exists persona_sets_read_accessible on public.persona_sets;
+drop policy if exists persona_sets_insert_owner on public.persona_sets;
+drop policy if exists persona_sets_update_owner on public.persona_sets;
+drop policy if exists persona_sets_delete_owner on public.persona_sets;
+
+drop policy if exists persona_set_items_read_accessible on public.persona_set_items;
+drop policy if exists persona_set_items_write_owner on public.persona_set_items;
+
+drop policy if exists games_host_only_select on public.games;
+drop policy if exists games_host_only_insert on public.games;
+drop policy if exists games_host_only_update on public.games;
+drop policy if exists games_host_only_delete on public.games;
+
+drop policy if exists game_rounds_host_only_all on public.game_rounds;
+drop policy if exists game_players_host_only_all on public.game_players;
+drop policy if exists idea_box_entries_host_only_all on public.idea_box_entries;
+drop policy if exists player_rankings_host_only_all on public.player_rankings;
+drop policy if exists round_results_host_only_all on public.round_results;
+drop policy if exists round_reactions_host_only_all on public.round_reactions;
+
+drop policy if exists history_entries_public_read on public.history_entries;
+drop policy if exists history_entries_owner_write on public.history_entries;
+drop policy if exists history_entry_players_public_read on public.history_entry_players;
+drop policy if exists history_entry_players_owner_write on public.history_entry_players;
+
+-- =========================
+-- Policies
+-- =========================
+
+create policy users_select_own
+on public.users
+for select
+to authenticated
+using ((select auth.uid()) = id);
+
+create policy users_insert_own
+on public.users
+for insert
+to authenticated
+with check ((select auth.uid()) = id and role = 'user');
+
+create policy users_update_own
+on public.users
+for update
+to authenticated
+using ((select auth.uid()) = id)
+with check ((select auth.uid()) = id and role = 'user');
+
+create policy users_delete_own
+on public.users
+for delete
+to authenticated
+using ((select auth.uid()) = id);
+
+create policy personas_public_read
+on public.personas
+for select
+to anon, authenticated
+using (is_active = true);
+
+create policy personas_authenticated_insert
+on public.personas
+for insert
+to authenticated
+with check (
+  created_by_user_id = (select auth.uid())
+  or (
+    category = 'core'
+    and created_by_user_id is null
+  )
+);
+
+create policy personas_authenticated_update
+on public.personas
+for update
+to authenticated
+using (
+  category = 'core'
+  or created_by_user_id = (select auth.uid())
+  or claimed_by_user_id = (select auth.uid())
+)
+with check (
+  category = 'core'
+  or created_by_user_id = (select auth.uid())
+  or claimed_by_user_id = (select auth.uid())
+);
+
+create policy persona_sets_read_accessible
+on public.persona_sets
+for select
+to anon, authenticated
+using (
+  visibility in ('shared', 'public')
+  or owner_user_id = (select auth.uid())
+);
+
+create policy persona_sets_insert_owner
+on public.persona_sets
+for insert
+to authenticated
+with check (owner_user_id = (select auth.uid()));
+
+create policy persona_sets_update_owner
+on public.persona_sets
+for update
+to authenticated
+using (owner_user_id = (select auth.uid()))
+with check (owner_user_id = (select auth.uid()));
+
+create policy persona_sets_delete_owner
+on public.persona_sets
+for delete
+to authenticated
+using (owner_user_id = (select auth.uid()));
+
+create policy persona_set_items_read_accessible
+on public.persona_set_items
+for select
+to anon, authenticated
+using (public.can_read_set(set_id));
+
+create policy persona_set_items_write_owner
+on public.persona_set_items
+for all
+to authenticated
+using (public.can_read_set(set_id) and exists (
+  select 1 from public.persona_sets s
+  where s.id = set_id and s.owner_user_id = (select auth.uid())
+))
+with check (exists (
+  select 1 from public.persona_sets s
+  where s.id = set_id and s.owner_user_id = (select auth.uid())
+));
+
+create policy games_host_only_select
+on public.games
+for select
+to authenticated
+using (host_user_id = (select auth.uid()));
+
+create policy games_host_only_insert
+on public.games
+for insert
+to authenticated
+with check (host_user_id = (select auth.uid()));
+
+create policy games_host_only_update
+on public.games
+for update
+to authenticated
+using (host_user_id = (select auth.uid()))
+with check (host_user_id = (select auth.uid()));
+
+create policy games_host_only_delete
+on public.games
+for delete
+to authenticated
+using (host_user_id = (select auth.uid()));
+
+create policy game_rounds_host_only_all
+on public.game_rounds
+for all
+to authenticated
+using (public.is_game_host(game_id))
+with check (public.is_game_host(game_id));
+
+create policy game_players_host_only_all
+on public.game_players
+for all
+to authenticated
+using (public.is_game_host(game_id))
+with check (public.is_game_host(game_id));
+
+create policy idea_box_entries_host_only_all
+on public.idea_box_entries
+for all
+to authenticated
+using (public.is_game_host(game_id))
+with check (public.is_game_host(game_id));
+
+create policy player_rankings_host_only_all
+on public.player_rankings
+for all
+to authenticated
+using (public.is_game_host(game_id))
+with check (public.is_game_host(game_id));
+
+create policy round_results_host_only_all
+on public.round_results
+for all
+to authenticated
+using (public.is_game_host(game_id))
+with check (public.is_game_host(game_id));
+
+create policy round_reactions_host_only_all
+on public.round_reactions
+for all
+to authenticated
+using (exists (
+  select 1
+  from public.game_rounds gr
+  join public.games g on g.id = gr.game_id
+  where gr.id = round_id
+    and g.host_user_id = (select auth.uid())
+))
+with check (exists (
+  select 1
+  from public.game_rounds gr
+  join public.games g on g.id = gr.game_id
+  where gr.id = round_id
+    and g.host_user_id = (select auth.uid())
+));
+
+create policy history_entries_public_read
+on public.history_entries
+for select
+to anon, authenticated
+using (true);
+
+create policy history_entries_owner_write
+on public.history_entries
+for all
+to authenticated
+using (created_by_user_id = (select auth.uid()))
+with check (created_by_user_id = (select auth.uid()));
+
+create policy history_entry_players_public_read
+on public.history_entry_players
+for select
+to anon, authenticated
+using (true);
+
+create policy history_entry_players_owner_write
+on public.history_entry_players
+for all
+to authenticated
+using (public.owns_history_entry(history_entry_id))
+with check (public.owns_history_entry(history_entry_id));
