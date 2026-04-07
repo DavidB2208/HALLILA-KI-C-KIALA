@@ -60,7 +60,6 @@ create table if not exists persona_set_items (
 create table if not exists games (
   id uuid primary key default gen_random_uuid(),
   admin_token text null,
-  public_join_token text null,
   live_state_json jsonb not null default '{}'::jsonb,
   host_user_id uuid null references users(id) on delete set null,
   title text null,
@@ -74,10 +73,6 @@ create table if not exists games (
   started_at timestamptz null,
   ended_at timestamptz null
 );
-
-alter table games add column if not exists admin_token text null;
-alter table games add column if not exists public_join_token text null;
-alter table games add column if not exists live_state_json jsonb not null default '{}'::jsonb;
 
 create table if not exists game_players (
   id uuid primary key default gen_random_uuid(),
@@ -232,5 +227,3 @@ from (values
 on conflict (slug) do nothing;
 
 create index if not exists idx_games_admin_token on games(admin_token);
-
-create index if not exists idx_games_public_join_token on games(public_join_token);

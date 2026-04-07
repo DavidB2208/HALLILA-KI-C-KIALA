@@ -35,6 +35,7 @@
   const USERS_KEY = 'hallila_accounts_users_v1';
   const CURRENT_USER_KEY = 'hallila_accounts_current_user_v1';
   const PERSONAS_KEY = 'hallila_accounts_personas_v1';
+  const INVITE_RETURN_KEY = 'hallila_invite_return_v1';
   const SUPABASE_CONFIG = window.HALLILA_SUPABASE_CONFIG || {};
 
   const SUPABASE_AUTH_REDIRECT = `${window.location.origin}${window.location.pathname}`;
@@ -96,9 +97,6 @@
       authPersonaId: '',
       authOtherName: '',
       authBoundUserId: null,
-      joinAuthExpanded: false,
-      joinResolvedRoomId: '',
-      joinResolvedJoinId: '',
       adminRecoveryKey: '',
       adminRecoveryStatus: 'idle',
       adminRecoveryError: '',
@@ -151,6 +149,46 @@
 
   function removeKey(key) {
     localStorage.removeItem(key);
+  }
+
+  function rememberInviteReturn(route) {
+    if (!route?.joinId) return;
+    writeJson(INVITE_RETURN_KEY, { joinId: route.joinId, themeHint: route.themeHint || '' });
+  }
+
+  function inviteReturnState() {
+    return readJson(INVITE_RETURN_KEY, null);
+  }
+
+  function clearInviteReturn() {
+    removeKey(INVITE_RETURN_KEY);
+  }
+
+  function isLocalOnlyHost(hostname) {
+    const host = String(hostname || '').toLowerCase();
+    if (!host) return false;
+    if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '[::1]' || host.endsWith('.local')) return true;
+    if (/^10\./.test(host) || /^192\.168\./.test(host)) return true;
+    const match = host.match(/^172\.(\d{1,3})\./);
+    if (match) {
+      const second = Number(match[1]);
+      if (second >= 16 && second <= 31) return true;
+    }
+    return false;
+  }
+
+  function shareLinkNeedsPublicHost(urlValue) {
+    try {
+      const url = new URL(urlValue);
+      return isLocalOnlyHost(url.hostname);
+    } catch {
+      return false;
+    }
+  }
+
+  function shareLinkWarningMarkup(urlValue) {
+    if (!shareLinkNeedsPublicHost(urlValue)) return '';
+    return `<div class="notice bad" style="margin-top:12px;">Le lien partagé pointe vers une adresse locale (${escapeHtml(urlValue)}). Les autres joueurs ne pourront rejoindre la partie que si le site est déployé sur une URL publique, par exemple via GitHub Pages.</div>`;
   }
 
   function slugify(value) {
@@ -662,7 +700,6 @@ function hydrateRoomPayload(rawRoom, roomId = null) {
   const room = cloneRoomForStorage(rawRoom);
   room.id = room.id || roomId || uid('room');
   room.adminToken = room.adminToken || uid('admin');
-  room.joinToken = room.joinToken || room.publicJoinToken || room.id;
   room.themeMode = room.themeMode || 'direct';
   room.items = normalizeItems(room.items || DEFAULT_ITEMS);
   room.themeBox = Array.isArray(room.themeBox) ? room.themeBox : [];
@@ -946,7 +983,6 @@ async function dbSyncRoom(room) {
   let response = await client.from('games').upsert({
     id: room.id,
     admin_token: room.adminToken || null,
-    public_join_token: room.joinToken || room.id,
     live_state_json: cloneRoomForStorage(room),
     host_user_id: room.hostUserId || null,
     title: room.historyTitle || null,
@@ -1314,77 +1350,49 @@ async function dbBootstrap() {
     }
   }
 
-  async function ensureJoinPreview(joinId) {
-    if (!joinId) return;
-    if (state.ui.joinPreviewRoom === joinId && (state.ui.joinPreviewStatus === 'connecting' || state.ui.joinPreviewStatus === 'ready')) return;
+  function ensureJoinPreview(roomId) {
+    if (!roomId) return;
+    if (state.ui.joinPreviewRoom === roomId && (state.ui.joinPreviewStatus === 'connecting' || state.ui.joinPreviewStatus === 'ready')) return;
     cleanupJoinPreview();
-    state.ui.joinPreviewRoom = joinId;
+    state.ui.joinPreviewRoom = roomId;
     state.ui.joinPreviewStatus = 'connecting';
     state.ui.joinPreviewError = '';
     state.ui.joinPreview = null;
-    state.ui.joinResolvedRoomId = '';
-    state.ui.joinResolvedJoinId = joinId;
-    render();
-
-    let resolvedRoom = null;
-    try {
-      resolvedRoom = await resolveJoinRoom(joinId);
-    } catch (error) {
-      if (state.ui.joinPreviewRoom !== joinId) return;
+    if (!window.Peer) {
       state.ui.joinPreviewStatus = 'error';
-      state.ui.joinPreviewError = error?.message || 'Impossible de vérifier la salle.';
-      render();
+      state.ui.joinPreviewError = 'Impossible de vérifier la salle.';
       return;
     }
-
-    if (state.ui.joinPreviewRoom !== joinId) return;
-    if (!resolvedRoom) {
-      state.ui.joinPreviewStatus = 'error';
-      state.ui.joinPreviewError = 'Salle introuvable via ce lien.';
-      render();
-      return;
-    }
-
-    state.ui.joinResolvedRoomId = resolvedRoom.id;
-    state.ui.joinPreview = publicSnapshot(resolvedRoom);
-    state.ui.joinPreviewStatus = 'ready';
-    state.ui.joinPreviewError = '';
-    render();
-
-    if (!window.Peer) return;
     const peer = new Peer(uid('hallila_preview'));
     state.previewPeer = peer;
     peer.on('open', () => {
-      const conn = peer.connect(resolvedRoom.id, { reliable: true });
+      const conn = peer.connect(roomId, { reliable: true });
       state.previewConn = conn;
       conn.on('open', () => conn.send({ type: 'peek' }));
       conn.on('data', (message) => {
-        if (state.ui.joinPreviewRoom !== joinId) return;
         if (message?.type === 'snapshot') {
           state.ui.joinPreview = message.room;
-          state.ui.joinResolvedRoomId = message.room?.id || resolvedRoom.id;
           state.ui.joinPreviewStatus = 'ready';
           state.ui.joinPreviewError = '';
           render();
           setTimeout(() => cleanupJoinPreview(), 60);
         }
-      });
-      conn.on('error', () => {
-        if (state.ui.joinPreviewRoom !== joinId) return;
-        if (!state.ui.joinPreview) {
+        if (message?.type === 'join-rejected') {
           state.ui.joinPreviewStatus = 'error';
-          state.ui.joinPreviewError = 'Salle indisponible.';
+          state.ui.joinPreviewError = message.reason || 'Couleur indisponible.';
           render();
         }
       });
-    });
-    peer.on('error', () => {
-      if (state.ui.joinPreviewRoom !== joinId) return;
-      if (!state.ui.joinPreview) {
+      conn.on('error', () => {
         state.ui.joinPreviewStatus = 'error';
         state.ui.joinPreviewError = 'Salle indisponible.';
         render();
-      }
+      });
+    });
+    peer.on('error', () => {
+      state.ui.joinPreviewStatus = 'error';
+      state.ui.joinPreviewError = 'Salle indisponible.';
+      render();
     });
   }
 
@@ -1475,47 +1483,6 @@ async function dbBootstrap() {
     return hydrateRoomPayload(room, roomId);
   }
 
-  function localRoomsStore() {
-    const keys = Object.keys(localStorage).filter((key) => key.startsWith(ACTIVE_ROOM_PREFIX));
-    return keys.map((key) => {
-      const roomId = key.replace(ACTIVE_ROOM_PREFIX, '');
-      return hydrateRoomPayload(readJson(key, null), roomId);
-    }).filter(Boolean);
-  }
-
-  function findLocalRoomByJoinId(joinId) {
-    if (!joinId) return null;
-    if (state.room && (state.room.id === joinId || state.room.joinToken === joinId)) return hydrateRoomPayload(state.room, state.room.id);
-    return localRoomsStore().find((room) => room.id === joinId || room.joinToken === joinId) || null;
-  }
-
-  async function dbResolveJoinRoom(joinId) {
-    const client = dbClient();
-    if (!client || !joinId) return null;
-    const filters = [`id.eq.${joinId}`];
-    filters.push(`public_join_token.eq.${joinId}`);
-    const response = await client
-      .from('games')
-      .select('id, public_join_token, live_state_json, host_user_id, theme_mode, theme_text, status')
-      .or(filters.join(','))
-      .maybeSingle();
-    if (response.error && response.error.code !== 'PGRST116') throw response.error;
-    if (!response.data) return null;
-    const room = hydrateRoomPayload(response.data.live_state_json || {}, response.data.id);
-    if (response.data.public_join_token) room.joinToken = response.data.public_join_token;
-    if (!room.hostUserId) room.hostUserId = response.data.host_user_id || null;
-    if (!room.themeMode) room.themeMode = response.data.theme_mode === 'idea_box' ? 'box' : 'direct';
-    if (!room.theme) room.theme = response.data.theme_text || '';
-    if (!room.status) room.status = response.data.status || 'lobby';
-    return room;
-  }
-
-  async function resolveJoinRoom(joinId) {
-    const local = findLocalRoomByJoinId(joinId);
-    if (local) return local;
-    return await dbResolveJoinRoom(joinId);
-  }
-
   function saveActiveRoom(room) {
     room.updatedAt = nowIso();
     writeJson(activeRoomKey(room.id), cloneRoomForStorage(room));
@@ -1558,22 +1525,14 @@ async function dbBootstrap() {
     removeKey(roundMarkKey(roomId, playerId));
   }
 
-  function makeAppUrl(params = {}, hash = '') {
+  function makeJoinLink(room) {
     const url = new URL(window.location.href);
     url.search = '';
     url.hash = '';
-    Object.entries(params).forEach(([key, value]) => {
-      if (value) url.searchParams.set(key, value);
-    });
-    url.hash = hash || '';
+    url.searchParams.set('join', room.id);
+    if (room.themeMode === 'box') url.searchParams.set('theme', 'Boîte à thème');
+    else if (room.theme) url.searchParams.set('theme', room.theme);
     return url.toString();
-  }
-
-  function makeJoinLink(room) {
-    return makeAppUrl({
-      join: room.joinToken || room.id,
-      theme: room.themeMode === 'box' ? 'Boîte à thème' : room.theme
-    }, '');
   }
 
   function normalizePseudo(room, pseudo) {
@@ -2273,7 +2232,7 @@ async function dbBootstrap() {
         state.ui.joinColor = session.color || state.ui.joinColor;
         state.ui.joinPseudo = session.pseudo || state.ui.joinPseudo;
         const currentRoute = getRoute();
-        setRoute({ join: session.joinId || roomId, theme: currentRoute.themeHint || '' }, '');
+        setRoute({ join: roomId, theme: currentRoute.themeHint || '' }, '');
         setNotice(message.reason || 'Impossible de rejoindre la partie.', 'bad', 4200);
         render();
         return;
@@ -2313,7 +2272,6 @@ async function dbBootstrap() {
     const room = {
       id: uid('room'),
       adminToken: uid('admin'),
-      joinToken: uid('join'),
       themeMode: themeMode || 'direct',
       theme: themeMode === 'direct' ? cleanTheme : '',
       historyTitle: String(historyTitle || '').trim() || (themeMode === 'direct' && cleanTheme ? `Résultat — ${cleanTheme}` : 'Résultat — Boîte à thème'),
@@ -2380,54 +2338,31 @@ async function dbBootstrap() {
     render();
   }
 
-  async function joinRoom(route, options = {}) {
+  function joinRoom(route) {
     const pseudo = (state.ui.joinPseudo || '').trim();
     if (!pseudo) {
       setNotice('Entre un pseudo valide.', 'warn');
-      return false;
+      return;
     }
     if (!window.Peer) {
       setNotice('PeerJS n’a pas chargé. Vérifie la connexion internet.', 'bad');
-      return false;
+      return;
     }
-
-    const resolvedRoom = await resolveJoinRoom(route.joinId);
-    if (!resolvedRoom) {
-      setNotice('Salle introuvable via ce lien.', 'bad');
-      return false;
-    }
-
-    const taken = usedColors(publicSnapshot(resolvedRoom));
-    if (taken.has(state.ui.joinColor)) {
-      setNotice('Cette couleur est déjà prise.', 'warn');
-      return false;
-    }
-
     const account = getCurrentUser();
     const linkedPersona = personaById(account?.linkedPersonaId);
-    const normalizedPseudo = normalizePseudo(resolvedRoom, pseudo);
     const session = {
       playerId: uid('player'),
-      pseudo: normalizedPseudo,
+      pseudo,
       color: state.ui.joinColor,
-      joinId: route.joinId,
       userId: account?.id || null,
       accountDisplayName: account?.displayName || null,
       linkedPersonaId: linkedPersona?.id || null,
       linkedPersonaName: linkedPersona?.name || null
     };
-    savePlayerSession(resolvedRoom.id, session);
-
-    if (options.openInNewTab) {
-      const url = makeAppUrl({ room: resolvedRoom.id, player: session.playerId }, '');
-      window.open(url, '_blank', 'noopener');
-      setNotice('Onglet joueur ouvert. Garde l’onglet admin ouvert en parallèle.', 'ok');
-      return true;
-    }
-
-    setRoute({ room: resolvedRoom.id, player: session.playerId }, '');
+    savePlayerSession(route.joinId, session);
+    clearInviteReturn();
+    setRoute({ room: route.joinId, player: session.playerId }, '');
     render();
-    return true;
   }
 
   function leavePlayerRoom() {
@@ -2858,58 +2793,15 @@ async function dbBootstrap() {
     `);
   }
 
-  function joinInlineAuthMarkup() {
-    if (!state.ui.joinAuthExpanded || getCurrentUser()) return '';
-    return `
-      <div class="card" style="display:grid;gap:16px;text-align:left;">
-        <div class="mode-row">
-          <button class="mode-btn ${state.ui.authTab === 'register' ? 'active' : ''}" data-action="switch-auth-register">Créer un compte</button>
-          <button class="mode-btn ${state.ui.authTab === 'login' ? 'active' : ''}" data-action="switch-auth-login">Connexion</button>
-          <button class="mode-btn ${state.ui.authTab === 'forgot' ? 'active' : ''}" data-action="switch-auth-forgot">Mot de passe oublié</button>
-        </div>
-        ${state.ui.authTab === 'register' ? `
-          <div class="form-grid">
-            <div><div class="label-top">Pseudo du compte</div><input id="auth-register-name" class="text-input" placeholder="Exemple : DavidB" value="${escapeHtml(state.ui.authRegisterName)}"></div>
-            <div><div class="label-top">Email</div><input id="auth-register-email" class="text-input" placeholder="toi@mail.com" value="${escapeHtml(state.ui.authRegisterEmail)}"></div>
-            <div><div class="label-top">Mot de passe</div><input id="auth-register-password" type="password" class="text-input" placeholder="••••••" value="${escapeHtml(state.ui.authRegisterPassword)}"></div>
-            <div class="row">
-              <button class="big-btn" style="min-width:0;width:auto;" data-action="create-account">Créer et continuer</button>
-              <button class="btn" data-action="join-auth-hide">Rester en invité</button>
-            </div>
-          </div>
-        ` : state.ui.authTab === 'login' ? `
-          <div class="form-grid">
-            <div><div class="label-top">Email</div><input id="auth-login-email" class="text-input" placeholder="toi@mail.com" value="${escapeHtml(state.ui.authLoginEmail)}"></div>
-            <div><div class="label-top">Mot de passe</div><input id="auth-login-password" type="password" class="text-input" placeholder="••••••" value="${escapeHtml(state.ui.authLoginPassword)}"></div>
-            <div class="row">
-              <button class="big-btn" style="min-width:0;width:auto;" data-action="login-account">Se connecter</button>
-              <button class="btn" data-action="join-auth-hide">Rester en invité</button>
-            </div>
-          </div>
-        ` : `
-          <div class="form-grid">
-            <div><div class="label-top">Email du compte</div><input id="auth-forgot-email" class="text-input" placeholder="toi@mail.com" value="${escapeHtml(state.ui.authForgotEmail)}"></div>
-            <div><div class="label-top">Nouveau mot de passe</div><input id="auth-forgot-password" type="password" class="text-input" placeholder="••••••" value="${escapeHtml(state.ui.authForgotPassword)}"></div>
-            <div><div class="label-top">Confirmer le nouveau mot de passe</div><input id="auth-forgot-confirm" type="password" class="text-input" placeholder="••••••" value="${escapeHtml(state.ui.authForgotConfirm)}"></div>
-            <div class="row">
-              <button class="big-btn" style="min-width:0;width:auto;" data-action="reset-password">Réinitialiser</button>
-              <button class="btn" data-action="switch-auth-login">Retour connexion</button>
-            </div>
-          </div>
-        `}
-      </div>
-    `;
-  }
-
   function renderJoin(route) {
     setWaitingTicker(null);
     syncJoinDefaultsFromAccount();
     ensureJoinPreview(route.joinId);
     const preview = state.ui.joinPreview;
-    const currentUser = getCurrentUser();
+    const account = getCurrentUser();
+    const linkedPersona = personaById(account?.linkedPersonaId);
     const title = preview?.themeMode === 'box' ? 'Boîte à thème' : (preview?.theme || route.themeHint || 'Tier list');
     const taken = usedColors(preview);
-    const isHostViewer = !!(currentUser && preview?.hostUserId && currentUser.id === preview.hostUserId);
     if (taken.has(state.ui.joinColor)) {
       const free = PLAYER_COLORS.find((color) => !taken.has(color));
       if (free) state.ui.joinColor = free;
@@ -2922,33 +2814,22 @@ async function dbBootstrap() {
             <div class="label-top">${title === 'Boîte à thème' ? 'Mode' : 'Thème'}</div>
             <div style="font-size:clamp(28px,3.4vw,46px);font-weight:800;">${escapeHtml(title)}</div>
           </div>
-          <div class="join-preview-status">${preview ? `${preview.players.length} joueur${preview.players.length > 1 ? 's' : ''} déjà connectés` : (state.ui.joinPreviewStatus === 'connecting' ? 'Vérification du lien de partie…' : 'La salle sera vérifiée à la connexion')}</div>
-
-          ${currentUser ? `
-            <div class="notice ok">
-              Compte détecté : <strong>${escapeHtml(currentUser.displayName)}</strong>${personaById(currentUser.linkedPersonaId) ? ` · Persona liée : ${escapeHtml(personaById(currentUser.linkedPersonaId).name)}` : ''}
+          <div class="join-preview-status">${preview ? `${preview.players.length} joueur${preview.players.length > 1 ? 's' : ''} déjà connectés` : (state.ui.joinPreviewStatus === 'connecting' ? 'Vérification de la salle…' : 'La salle sera vérifiée à la connexion')}</div>
+          ${account ? `
+            <div class="account-badge">
+              <strong>Compte détecté : ${escapeHtml(account.displayName)}</strong>
+              <span>${linkedPersona ? `Persona liée : ${escapeHtml(linkedPersona.name)}` : 'Aucune persona liée pour le moment.'}</span>
+              <div class="row">
+                <button class="btn" data-action="go-profile">Gérer mon compte</button>
+                <span class="footer-note">Tu peux aussi jouer directement depuis ce lien avec ce compte.</span>
+              </div>
             </div>
           ` : `
-            <div class="card" style="display:grid;gap:12px;text-align:left;">
-              <div class="label-top">Choix d’entrée</div>
-              <div class="subtle">Tu peux jouer tout de suite en invité, ou créer / connecter un compte pour garder ton profil et tes stats.</div>
-              <div class="row">
-                <button class="btn ${!state.ui.joinAuthExpanded ? 'active' : ''}" data-action="join-auth-hide">Continuer sans compte</button>
-                <button class="btn ${state.ui.joinAuthExpanded ? 'active' : ''}" data-action="join-auth-show">Créer un compte / Connexion</button>
-              </div>
+            <div class="row" style="justify-content:space-between;align-items:center;">
+              <div class="footer-note">Tu peux jouer sans compte ou créer / connecter un compte avant de rejoindre.</div>
+              <button class="btn" data-action="go-account">Créer un compte / Connexion</button>
             </div>
-            ${joinInlineAuthMarkup()}
           `}
-
-          ${isHostViewer ? `
-            <div class="notice warn">
-              Tu es aussi l’admin de cette salle. Pour jouer sans couper l’admin, ouvre ta place joueur dans un autre onglet.
-              <div class="row" style="margin-top:10px;">
-                <button class="btn" data-action="open-player-link">Ouvrir ma place joueur dans un autre onglet</button>
-              </div>
-            </div>
-          ` : ''}
-
           <div>
             <div class="label-top">Pseudo</div>
             <input id="join-pseudo" class="text-input" placeholder="Entre ton pseudo" value="${escapeHtml(state.ui.joinPseudo)}">
@@ -2964,16 +2845,15 @@ async function dbBootstrap() {
             <div class="footer-note" style="margin-top:8px;">Une couleur déjà choisie devient indisponible pour les autres joueurs.</div>
           </div>
           <div class="row">
-            <button class="big-btn" style="min-width:0;width:auto;" data-action="join-room">Rejoindre la partie</button>
+            <button class="big-btn" style="min-width:0;width:auto;" data-action="join-room">Continuer sans compte / rejoindre</button>
             <button class="btn" data-action="go-home">Annuler</button>
           </div>
           ${state.ui.joinPreviewError ? `<div style="color:var(--bad);">${escapeHtml(state.ui.joinPreviewError)}</div>` : ''}
-          <div class="footer-note">Une fois la partie créée, les joueurs rejoignent la salle grâce au lien partagé. L’admin peut aussi rejoindre via ce lien en ouvrant une place joueur séparée.</div>
+          <div class="footer-note">Le lien partagé fonctionne entre appareils. L’admin doit rester connecté pendant la partie. Si tu es l’admin, ouvre ce lien dans un autre onglet pour jouer aussi.</div>
         </div>
       </div>
     `);
   }
-
 
   function renderAccount() {
     setWaitingTicker(null);
@@ -2985,11 +2865,12 @@ async function dbBootstrap() {
       return;
     }
     const availableCore = availableCorePersonas();
+    const inviteReturn = inviteReturnState();
     layout('Compte', `
       <div class="topbar">
-        <button class="btn" data-action="go-home">Retour</button>
+        <button class="btn" data-action="go-home">${inviteReturn?.joinId ? 'Retour au lien' : 'Retour'}</button>
         ${brand()}
-        <div class="meta-side"><div class="subtle">Compte local de démonstration</div></div>
+        <div class="meta-side"><div class="subtle">${remoteAuthEnabled() ? 'Supabase Auth activé' : 'Compte local de démonstration'}</div></div>
       </div>
       <div class="create-stack">
         <div class="card">
@@ -3072,13 +2953,14 @@ async function dbBootstrap() {
     const stats = personaStatsForUser(user);
     const entries = userHistoryEntries(user);
     const availableCore = availableCorePersonas(user.id);
+    const inviteReturn = inviteReturnState();
     layout('Mon compte', `
       <div class="topbar">
-        <button class="btn" data-action="go-home">Retour</button>
+        <button class="btn" data-action="go-home">${inviteReturn?.joinId ? 'Retour au lien' : 'Retour'}</button>
         ${brand()}
         <div class="meta-side">
           <button class="btn" data-action="logout-account">Déconnexion</button>
-          <div class="subtle">Compte local</div>
+          <div class="subtle">${remoteAuthEnabled() ? 'Compte synchronisé Supabase' : 'Compte local'}</div>
         </div>
       </div>
       <div class="create-stack">
@@ -3191,6 +3073,7 @@ async function dbBootstrap() {
     syncItemEditor(room);
     state.ui.themeMode = room.themeMode || 'direct';
     state.ui.theme = room.theme || '';
+    const shareLink = makeJoinLink(room);
     layout('Attente de joueurs', `
       <div class="topbar">
         <button class="btn" data-action="go-home">Retour</button>
@@ -3233,14 +3116,16 @@ async function dbBootstrap() {
 
       <div class="share-box">
         <div class="label-top">Lien à partager</div>
-        <input id="share-url" class="share-url" readonly value="${escapeHtml(makeJoinLink(room))}">
+        <input id="share-url" class="share-url" readonly value="${escapeHtml(shareLink)}">
         <div class="row" style="justify-content:space-between;">
           <div class="row">
             <button class="btn" data-action="copy-link">Copier le lien</button>
-            <button class="btn" data-action="open-player-link">Me joindre comme joueur</button>
+            <button class="btn" data-action="admin-join-as-player">Me joindre comme joueur</button>
           </div>
           <div class="subtle">${room.themeMode === 'box' ? `${themeBoxCount(room)} thème${themeBoxCount(room) > 1 ? 's' : ''} dans la boîte` : 'Prêt à démarrer'}</div>
         </div>
+        <div class="footer-note" style="margin-top:10px;">Pour jouer en étant admin, ouvre le lien joueur dans un autre onglet et garde cet onglet ouvert pour gérer la partie.</div>
+        ${shareLinkWarningMarkup(shareLink)}
       </div>
 
       ${room.themeMode === 'box' ? `
@@ -3309,7 +3194,7 @@ async function dbBootstrap() {
         <div class="meta-side">
           <div class="state-pill">${submitted}/${room.players.length}</div>
           ${networkBadge()}
-          <div class="subtle">Admin hôte · peut aussi se joindre via le lien</div>
+          <div class="subtle">Tu peux aussi rejoindre via le lien dans un autre onglet</div>
         </div>
       </div>
 
@@ -3968,6 +3853,13 @@ async function dbBootstrap() {
     const route = getRoute();
 
     if (action === 'go-home') {
+      const inviteReturn = inviteReturnState();
+      if ((route.hash === '#account' || route.hash === '#profile') && inviteReturn?.joinId) {
+        setRoute({ join: inviteReturn.joinId, theme: inviteReturn.themeHint || '' }, '');
+        render();
+        return;
+      }
+      if (route.joinId) clearInviteReturn();
       setRoute({}, '');
       render();
       return;
@@ -3982,11 +3874,13 @@ async function dbBootstrap() {
       return;
     }
     if (action === 'go-account') {
+      rememberInviteReturn(route);
       setRoute({}, '#account');
       render();
       return;
     }
     if (action === 'go-profile') {
+      rememberInviteReturn(route);
       setRoute({}, '#profile');
       render();
       return;
@@ -3994,6 +3888,13 @@ async function dbBootstrap() {
     if (action === 'go-history') {
       setRoute({}, '#history');
       render();
+      return;
+    }
+    if (action === 'admin-join-as-player') {
+      if (!state.room) return;
+      const shareLink = makeJoinLink(state.room);
+      try { window.open(shareLink, '_blank', 'noopener'); } catch {}
+      setNotice('Le lien joueur a été ouvert dans un autre onglet. Garde cet onglet admin ouvert.', 'ok', 4200);
       return;
     }
     if (action === 'go-player-lists') {
@@ -4069,40 +3970,35 @@ async function dbBootstrap() {
       const result = await createAccountFromUi();
       if (!result.ok) { setNotice(result.error, 'bad'); return; }
       setNotice(result.message || 'Compte créé. Tu peux maintenant jouer et suivre tes stats.', 'ok');
-      if (route.joinId) {
-        state.ui.joinAuthExpanded = false;
-        render();
-      } else {
-        setRoute({}, '#profile');
-        render();
-      }
+      const inviteReturn = inviteReturnState();
+      if (inviteReturn?.joinId) setRoute({ join: inviteReturn.joinId, theme: inviteReturn.themeHint || '' }, '');
+      else setRoute({}, '#profile');
+      render();
       return;
     }
     if (action === 'login-account') {
       const result = await loginAccountFromUi();
       if (!result.ok) { setNotice(result.error, 'bad'); return; }
       setNotice(result.message || 'Connexion réussie.', 'ok');
-      if (route.joinId) {
-        state.ui.joinAuthExpanded = false;
-        render();
-      } else {
-        setRoute({}, '#profile');
-        render();
-      }
+      const inviteReturn = inviteReturnState();
+      if (inviteReturn?.joinId) setRoute({ join: inviteReturn.joinId, theme: inviteReturn.themeHint || '' }, '');
+      else setRoute({}, '#profile');
+      render();
       return;
     }
     if (action === 'reset-password') {
       const result = await resetPasswordFromUi();
       if (!result.ok) { setNotice(result.error, 'bad'); return; }
       setNotice(result.message || 'Mot de passe réinitialisé. Tu peux maintenant te connecter.', 'ok', 4200);
-      if (route.joinId) state.ui.joinAuthExpanded = true;
       render();
       return;
     }
     if (action === 'logout-account') {
       await logoutAccount();
       setNotice('Déconnexion effectuée.', 'ok');
-      setRoute({}, '');
+      const inviteReturn = inviteReturnState();
+      if (inviteReturn?.joinId) setRoute({ join: inviteReturn.joinId, theme: inviteReturn.themeHint || '' }, '');
+      else setRoute({}, '');
       render();
       return;
     }
@@ -4146,29 +4042,13 @@ async function dbBootstrap() {
         });
       return;
     }
-    if (action === 'join-auth-show') {
-      state.ui.joinAuthExpanded = true;
-      render();
-      return;
-    }
-    if (action === 'join-auth-hide') {
-      state.ui.joinAuthExpanded = false;
-      render();
-      return;
-    }
-    if (action === 'open-player-link') {
-      const sourceRoute = getRoute();
-      const joinRoute = sourceRoute.joinId ? sourceRoute : { ...sourceRoute, joinId: state.room?.joinToken || state.room?.id || '' };
-      await joinRoom(joinRoute, { openInNewTab: true });
-      return;
-    }
     if (action === 'join-room') {
       const taken = usedColors(state.ui.joinPreview);
       if (taken.has(state.ui.joinColor)) {
         setNotice('Cette couleur est déjà prise.', 'warn');
         return;
       }
-      await joinRoom(route);
+      joinRoom(route);
       return;
     }
     if (action === 'leave-room') {
